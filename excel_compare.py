@@ -354,7 +354,7 @@ def _minutes_to_time(minutes: int) -> dt.time:
     return dt.time(minutes // 60, minutes % 60)
 
 
-def _read_report_shifts_event_log(wb, config: ComparisonConfig) -> list[_ReportShift]:
+def _read_report_shifts_event_log(wb, config: ComparisonConfig) -> tuple[list[_ReportShift], list[_ReportDay]]:
     last_error = None
     for ws in wb.worksheets:
         for header_row, headers in _iter_header_candidates(ws, max_header_rows=40):
@@ -397,19 +397,35 @@ def _read_report_shifts_event_log(wb, config: ComparisonConfig) -> list[_ReportS
                 events.setdefault(fio_key, []).append((ts, et))
 
             shifts: list[_ReportShift] = []
+            one_sided: list[_ReportDay] = []
             for fio_key, seq in events.items():
                 seq.sort(key=lambda x: x[0])
-                open_in = None
+                fio = fio_display_by_key.get(fio_key, fio_for_output(fio_key))
+                open_in: dt.datetime | None = None
                 for ts, et in seq:
                     if et == 'in':
                         if open_in is None:
                             open_in = ts
                         else:
-                            # Уже есть открытый вход — если новый вход на более позднюю дату, обновляем
+                            # Уже есть открытый вход — если новый вход на более позднюю дату,
+                            # предыдущий вход был односторонней отметкой
                             if ts.date() > open_in.date():
+                                one_sided.append(_ReportDay(
+                                    fio_key=fio_key, fio=fio, date=open_in.date(),
+                                    arrival_min=open_in.hour * 60 + open_in.minute,
+                                    departure_min=None,
+                                    mark_type='arrival_only', report_minutes=None,
+                                ))
                                 open_in = ts
                     else:  # et == 'out'
                         if open_in is None:
+                            # ИСПРАВЛЕНИЕ 2: выход без входа — односторонняя отметка
+                            one_sided.append(_ReportDay(
+                                fio_key=fio_key, fio=fio, date=ts.date(),
+                                arrival_min=None,
+                                departure_min=ts.hour * 60 + ts.minute,
+                                mark_type='departure_only', report_minutes=None,
+                            ))
                             continue
                         if ts < open_in:
                             continue
@@ -417,6 +433,13 @@ def _read_report_shifts_event_log(wb, config: ComparisonConfig) -> list[_ReportS
                         # ИСПРАВЛЕНИЕ 1: Рамка 27 часов (1620 минут) вместо 24 часов (1440)
                         # Если вход и выход в пределах 27 часов — это одна смена
                         if minutes > 1620:
+                            # Слишком большая разница — вход считается односторонней отметкой
+                            one_sided.append(_ReportDay(
+                                fio_key=fio_key, fio=fio, date=open_in.date(),
+                                arrival_min=open_in.hour * 60 + open_in.minute,
+                                departure_min=None,
+                                mark_type='arrival_only', report_minutes=None,
+                            ))
                             open_in = None
                             continue
                         # Обед вычитается если смена >= 6 часов (360 минут)
@@ -425,15 +448,23 @@ def _read_report_shifts_event_log(wb, config: ComparisonConfig) -> list[_ReportS
                         minutes = max(minutes, 0)
                         shifts.append(_ReportShift(
                             fio_key=fio_key,
-                            fio=fio_display_by_key.get(fio_key, fio_for_output(fio_key)),
+                            fio=fio,
                             start_dt=open_in,
                             end_dt=ts,
                             report_minutes=int(minutes),
                         ))
                         open_in = None
+                # После обработки всех событий: незакрытый вход — односторонняя отметка
+                if open_in is not None:
+                    one_sided.append(_ReportDay(
+                        fio_key=fio_key, fio=fio, date=open_in.date(),
+                        arrival_min=open_in.hour * 60 + open_in.minute,
+                        departure_min=None,
+                        mark_type='arrival_only', report_minutes=None,
+                    ))
 
             if shifts:
-                return shifts
+                return shifts, one_sided
             last_error = InputFormatError('В отчёте (лог событий) не нашёл ни одной пары Вход/Выход.')
     if last_error:
         raise last_error
@@ -483,8 +514,8 @@ def _report_days_to_shifts(report_days: list[_ReportDay], config: ComparisonConf
 def _read_report_shifts(report_excel_bytes: bytes, config: ComparisonConfig) -> tuple[list[_ReportShift], list[_ReportDay]]:
     wb = _load_workbook_from_bytes(report_excel_bytes)
     try:
-        shifts = _read_report_shifts_event_log(wb, config)
-        return shifts, []
+        shifts, one_sided_days = _read_report_shifts_event_log(wb, config)
+        return shifts, one_sided_days
     except InputFormatError:
         report_days = _read_report_days(report_excel_bytes, config)
         shifts, one_sided_days = _report_days_to_shifts(report_days, config)
