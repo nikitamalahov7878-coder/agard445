@@ -727,10 +727,16 @@ def _parse_timesheet_header_date(value: Any, reference_dates: list[dt.date] | No
     if m:
         try:
             day_num = int(m.group('day'))
+            wd = m.group('wd') or ''
             if reference_dates:
+                # When weekday is present, use it to disambiguate between months
                 for ref in reference_dates:
                     if ref.day == day_num:
-                        return ref
+                        if wd and wd in _RU_WEEKDAY:
+                            if ref.weekday() == _RU_WEEKDAY[wd]:
+                                return ref
+                        else:
+                            return ref
         except (ValueError, TypeError):
             pass
     return None
@@ -823,12 +829,14 @@ def _is_timesheet_non_employee_row(row: tuple, fio_idx: int) -> bool:
         return True
     if _TIMESHEET_GROUP_RE.match(text):
         return True
-    first_cell = row[0] if row else None
-    first_value = getattr(first_cell, 'value', first_cell)
-    first_text = str(first_value).strip() if first_value is not None else ''
     is_bold = bool(getattr(getattr(fio_cell, 'font', None), 'bold', False))
-    if first_text.startswith('#') or is_bold:
+    if is_bold:
         return True
+    # '#' in column 0 only indicates a section header when the FIO column is also 0
+    if fio_idx == 0:
+        first_text = str(fio_value).strip()
+        if first_text.startswith('#'):
+            return True
     return False
 
 
@@ -1125,12 +1133,12 @@ def _build_output_workbook(
         report_minutes_by_day[key] = report_minutes_by_day.get(key, 0) + int(s.report_minutes)
         fio_by_key.setdefault(s.fio_key, s.fio)
 
-    # Лист 1: Табель > отчёта (где в отчёте больше, чем в табеле)
+    # Лист 1: Табель > отчёта (табель превышает отчёт более чем на threshold)
     sheet1 = []
     for (fio_key, day), report_minutes in report_minutes_by_day.items():
         t_minutes = int(timesheet_minutes.get((fio_key, day)) or 0)
         diff = t_minutes - int(report_minutes)
-        if diff > config.threshold_minutes:
+        if diff <= config.threshold_minutes:
             continue
         fio_value = (
             fio_by_key.get(fio_key)
