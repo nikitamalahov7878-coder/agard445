@@ -1148,6 +1148,7 @@ def _build_output_workbook(
         sheet1.append((fio_value, day, t_minutes, int(report_minutes), diff))
 
     # Лист 2: В табеле есть, в отчёте нет
+    one_sided_keys = {(d.fio_key, d.date) for d in (one_sided_days or [])}
     sheet2 = []
     for (fio_key, day), t_minutes in timesheet_minutes.items():
         if not _is_in_period(day, config):
@@ -1155,6 +1156,8 @@ def _build_output_workbook(
         if t_minutes is None or t_minutes <= 0:
             continue
         if (fio_key, day) in report_minutes_by_day:
+            continue
+        if (fio_key, day) in one_sided_keys:
             continue
         fio_value = timesheet_fio_by_key.get(fio_key, fio_for_output(fio_key))
         sheet2.append((fio_value, day, 0, int(t_minutes)))
