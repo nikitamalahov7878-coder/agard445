@@ -398,64 +398,113 @@ def _read_report_shifts_event_log(wb, config: ComparisonConfig) -> tuple[list[_R
 
             shifts: list[_ReportShift] = []
             one_sided: list[_ReportDay] = []
+
+            # Максимальный перерыв внутри одной смены (4 часа).
+            # Если человек отсутствовал дольше — это конец смены, не перерыв.
+            _MAX_BREAK_MIN = 240
+
+            def _record_shift(fio_key, fio, shift_start, shift_end, mid_gap_min):
+                total_raw = int((shift_end - shift_start).total_seconds() // 60)
+                if mid_gap_min > 0:
+                    # Человек выходил в течение смены
+                    if total_raw >= 360:
+                        # Если перерыв < часа — вычитаем стандартный обед (60 мин),
+                        # перерыв поглощается обедом. Если >= часа — вычитаем фактический
+                        # перерыв целиком (он уже включает стандартный обед + сверх).
+                        deduction = max(mid_gap_min, config.lunch_break_minutes)
+                    elif mid_gap_min >= config.lunch_break_minutes:
+                        # Смена < 6 часов, но перерыв длинный — вычитаем только сам перерыв
+                        deduction = mid_gap_min
+                    else:
+                        # Смена < 6 часов и перерыв < часа — ничего не вычитаем
+                        deduction = 0
+                else:
+                    # Выходов внутри смены не было — стандартное вычитание обеда
+                    deduction = config.lunch_break_minutes if total_raw >= 360 else 0
+                effective = max(total_raw - deduction, 0)
+                shifts.append(_ReportShift(
+                    fio_key=fio_key, fio=fio,
+                    start_dt=shift_start, end_dt=shift_end,
+                    report_minutes=effective,
+                ))
+
             for fio_key, seq in events.items():
                 seq.sort(key=lambda x: x[0])
                 fio = fio_display_by_key.get(fio_key, fio_for_output(fio_key))
                 open_in: dt.datetime | None = None
+                gap_start: dt.datetime | None = None  # момент выхода в перерыве
+                mid_gap: int = 0  # суммарный перерыв внутри текущей смены (мин)
+
                 for ts, et in seq:
                     if et == 'in':
                         if open_in is None:
+                            # Начало новой смены
                             open_in = ts
-                        else:
-                            # Уже есть открытый вход — если новый вход на более позднюю дату,
-                            # предыдущий вход был односторонней отметкой
-                            if ts.date() > open_in.date():
-                                one_sided.append(_ReportDay(
-                                    fio_key=fio_key, fio=fio, date=open_in.date(),
-                                    arrival_min=open_in.hour * 60 + open_in.minute,
-                                    departure_min=None,
-                                    mark_type='arrival_only', report_minutes=None,
-                                ))
+                            mid_gap = 0
+                            gap_start = None
+                        elif gap_start is not None:
+                            # Вернулся с перерыва
+                            gap_dur = int((ts - gap_start).total_seconds() // 60)
+                            if gap_dur > _MAX_BREAK_MIN:
+                                # Слишком длинный перерыв — закрываем предыдущую смену
+                                _record_shift(fio_key, fio, open_in, gap_start, mid_gap)
                                 open_in = ts
+                                mid_gap = 0
+                            else:
+                                mid_gap += gap_dur
+                            gap_start = None
+                        # else: дублирующий вход пока уже внутри смены без gap — игнорируем
                     else:  # et == 'out'
                         if open_in is None:
-                            # ИСПРАВЛЕНИЕ 2: выход без входа — односторонняя отметка
+                            # Выход без входа — односторонняя отметка
                             one_sided.append(_ReportDay(
                                 fio_key=fio_key, fio=fio, date=ts.date(),
                                 arrival_min=None,
                                 departure_min=ts.hour * 60 + ts.minute,
                                 mark_type='departure_only', report_minutes=None,
                             ))
-                            continue
-                        if ts < open_in:
-                            continue
-                        minutes = int((ts - open_in).total_seconds() // 60)
-                        # ИСПРАВЛЕНИЕ 1: Рамка 27 часов (1620 минут) вместо 24 часов (1440)
-                        # Если вход и выход в пределах 27 часов — это одна смена
-                        if minutes > 1620:
-                            # Слишком большая разница — вход считается односторонней отметкой
-                            one_sided.append(_ReportDay(
-                                fio_key=fio_key, fio=fio, date=open_in.date(),
-                                arrival_min=open_in.hour * 60 + open_in.minute,
-                                departure_min=None,
-                                mark_type='arrival_only', report_minutes=None,
-                            ))
-                            open_in = None
-                            continue
-                        # Обед вычитается если смена >= 6 часов (360 минут)
-                        if minutes >= 360:
-                            minutes -= config.lunch_break_minutes
-                        minutes = max(minutes, 0)
-                        shifts.append(_ReportShift(
-                            fio_key=fio_key,
-                            fio=fio,
-                            start_dt=open_in,
-                            end_dt=ts,
-                            report_minutes=int(minutes),
+                        elif gap_start is not None:
+                            # Дублирующий выход, игнорируем
+                            pass
+                        else:
+                            span = int((ts - open_in).total_seconds() // 60)
+                            if span > 1620:
+                                # Вход висит больше 27 часов — односторонняя отметка на вход
+                                one_sided.append(_ReportDay(
+                                    fio_key=fio_key, fio=fio, date=open_in.date(),
+                                    arrival_min=open_in.hour * 60 + open_in.minute,
+                                    departure_min=None,
+                                    mark_type='arrival_only', report_minutes=None,
+                                ))
+                                open_in = None
+                                # Сам выход теперь висит без входа — тоже односторонний
+                                one_sided.append(_ReportDay(
+                                    fio_key=fio_key, fio=fio, date=ts.date(),
+                                    arrival_min=None,
+                                    departure_min=ts.hour * 60 + ts.minute,
+                                    mark_type='departure_only', report_minutes=None,
+                                ))
+                            else:
+                                # Выход — либо конец смены, либо начало перерыва;
+                                # узнаем по следующему событию (если вход вернётся — перерыв)
+                                gap_start = ts
+
+                # Конец событий для этого сотрудника
+                if gap_start is not None and open_in is not None:
+                    # Последнее событие было выход — это конец смены
+                    span = int((gap_start - open_in).total_seconds() // 60)
+                    if span > 1620:
+                        one_sided.append(_ReportDay(
+                            fio_key=fio_key, fio=fio, date=open_in.date(),
+                            arrival_min=open_in.hour * 60 + open_in.minute,
+                            departure_min=None,
+                            mark_type='arrival_only', report_minutes=None,
                         ))
-                        open_in = None
-                # После обработки всех событий: незакрытый вход — односторонняя отметка
+                    else:
+                        _record_shift(fio_key, fio, open_in, gap_start, mid_gap)
+                    open_in = None
                 if open_in is not None:
+                    # Незакрытый вход — односторонняя отметка
                     one_sided.append(_ReportDay(
                         fio_key=fio_key, fio=fio, date=open_in.date(),
                         arrival_min=open_in.hour * 60 + open_in.minute,
