@@ -412,12 +412,9 @@ def _read_report_shifts_event_log(wb, config: ComparisonConfig) -> tuple[list[_R
                         # перерыв поглощается обедом. Если >= часа — вычитаем фактический
                         # перерыв целиком (он уже включает стандартный обед + сверх).
                         deduction = max(mid_gap_min, config.lunch_break_minutes)
-                    elif mid_gap_min >= config.lunch_break_minutes:
-                        # Смена < 6 часов, но перерыв длинный — вычитаем только сам перерыв
-                        deduction = mid_gap_min
                     else:
-                        # Смена < 6 часов и перерыв < часа — ничего не вычитаем
-                        deduction = 0
+                        # Смена < 6 часов — обед не предусмотрен, вычитаем фактическое время выхода
+                        deduction = mid_gap_min
                 else:
                     # Выходов внутри смены не было — стандартное вычитание обеда
                     deduction = config.lunch_break_minutes if total_raw >= 360 else 0
