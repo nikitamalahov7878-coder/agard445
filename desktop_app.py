@@ -38,6 +38,7 @@ class CompareRequest:
     timesheet_paths: tuple[Path, ...]
     batch_paths: tuple[Path, ...]
     output_path: Path
+    notebook_path: Path | None = None
 
 
 def _period_bounds(period_mode: str) -> tuple[int | None, int | None]:
@@ -66,16 +67,20 @@ def _normalize_output_path(path_text: str) -> Path:
 
 
 def _compare_two_excel_files(
-    file_a: Path, file_b: Path, config: ComparisonConfig
+    file_a: Path, file_b: Path, config: ComparisonConfig,
+    notebook_path: Path | None = None,
 ) -> tuple[bytes, str]:
+    notebook_bytes = notebook_path.read_bytes() if notebook_path and notebook_path.is_file() else None
     try:
         result = compare_report_and_timesheet(
-            file_a.read_bytes(), file_b.read_bytes(), config=config
+            file_a.read_bytes(), file_b.read_bytes(), config=config,
+            notebook_excel_bytes=notebook_bytes,
         )
         return result, make_sverka_filename(file_a.name, file_b.name)
     except InputFormatError:
         result = compare_report_and_timesheet(
-            file_b.read_bytes(), file_a.read_bytes(), config=config
+            file_b.read_bytes(), file_a.read_bytes(), config=config,
+            notebook_excel_bytes=notebook_bytes,
         )
         return result, make_sverka_filename(file_a.name, file_b.name)
 
@@ -126,6 +131,7 @@ class SverkaApp(tk.Tk):
         self.period_var = tk.StringVar(value=PERIOD_FULL)
         self.primary_path_var = tk.StringVar()
         self.secondary_path_var = tk.StringVar()
+        self.notebook_path_var = tk.StringVar()
         self.output_path_var = tk.StringVar()
         self.status_var = tk.StringVar(value='Готово к работе.')
 
@@ -240,6 +246,15 @@ class SverkaApp(tk.Tk):
         )
         self.secondary_button.grid(row=1, column=2, sticky='ew', pady=4)
 
+        self.notebook_label = ttk.Label(files_frame, text='Тетрадь (необязательно)')
+        self.notebook_label.grid(row=2, column=0, sticky='w', pady=4)
+        self.notebook_entry = ttk.Entry(files_frame, textvariable=self.notebook_path_var)
+        self.notebook_entry.grid(row=2, column=1, sticky='ew', padx=8, pady=4)
+        self.notebook_button = ttk.Button(
+            files_frame, text='Выбрать...', command=self._choose_notebook
+        )
+        self.notebook_button.grid(row=2, column=2, sticky='ew', pady=4)
+
         # Multi-file frame (inside files_frame)
         self.multi_frame = ttk.Frame(files_frame)
         self.multi_frame.grid(row=1, column=0, columnspan=3, sticky='nsew', pady=4)
@@ -333,6 +348,9 @@ class SverkaApp(tk.Tk):
             self.secondary_label.grid_remove()
             self.secondary_entry.grid_remove()
             self.secondary_button.grid_remove()
+            self.notebook_label.grid_remove()
+            self.notebook_entry.grid_remove()
+            self.notebook_button.grid_remove()
             self.multi_frame.grid()
             self._set_period_controls_enabled(True)
 
@@ -347,6 +365,9 @@ class SverkaApp(tk.Tk):
             self.secondary_label.grid_remove()
             self.secondary_entry.grid_remove()
             self.secondary_button.grid_remove()
+            self.notebook_label.grid_remove()
+            self.notebook_entry.grid_remove()
+            self.notebook_button.grid_remove()
             self.multi_frame.grid(row=1, column=0, columnspan=3, sticky='nsew', pady=4)
             self._set_period_controls_enabled(True)
 
@@ -359,6 +380,9 @@ class SverkaApp(tk.Tk):
             self.secondary_label.grid()
             self.secondary_entry.grid()
             self.secondary_button.grid()
+            self.notebook_label.grid_remove()
+            self.notebook_entry.grid_remove()
+            self.notebook_button.grid_remove()
             self.multi_frame.grid_remove()
             self.primary_label.grid()
             self.primary_entry.grid()
@@ -377,6 +401,9 @@ class SverkaApp(tk.Tk):
             self.secondary_label.grid()
             self.secondary_entry.grid()
             self.secondary_button.grid()
+            self.notebook_label.grid()
+            self.notebook_entry.grid()
+            self.notebook_button.grid()
             self.multi_frame.grid_remove()
             self._set_period_controls_enabled(True)
 
@@ -404,6 +431,15 @@ class SverkaApp(tk.Tk):
             return
         self.secondary_path_var.set(path)
         self._refresh_output_path()
+
+    def _choose_notebook(self) -> None:
+        path = filedialog.askopenfilename(
+            title='Выберите тетрадь',
+            filetypes=[('Excel files', '*.xlsx'), ('All files', '*.*')],
+        )
+        if not path:
+            return
+        self.notebook_path_var.set(path)
 
     def _add_timesheets(self) -> None:
         paths = filedialog.askopenfilenames(
@@ -514,6 +550,7 @@ class SverkaApp(tk.Tk):
             return
         self.primary_path_var.set('')
         self.secondary_path_var.set('')
+        self.notebook_path_var.set('')
         self.output_path_var.set('')
         self.timesheet_paths.clear()
         self.batch_paths.clear()
@@ -573,6 +610,9 @@ class SverkaApp(tk.Tk):
             else:
                 output_path = _normalize_output_path(output_text)
 
+        notebook_text = self.notebook_path_var.get().strip()
+        notebook_path_val = Path(notebook_text) if notebook_text else None
+
         return CompareRequest(
             mode=mode,
             period=self.period_var.get(),
@@ -581,6 +621,7 @@ class SverkaApp(tk.Tk):
             timesheet_paths=timesheet_paths,
             batch_paths=batch_paths,
             output_path=output_path,
+            notebook_path=notebook_path_val,
         )
 
     def _start_compare(self) -> None:
@@ -650,7 +691,8 @@ class SverkaApp(tk.Tk):
 
             assert request.secondary_path is not None
             result, _ = _compare_two_excel_files(
-                request.primary_path, request.secondary_path, config=config
+                request.primary_path, request.secondary_path, config=config,
+                notebook_path=request.notebook_path,
             )
             return _ensure_result_note(result, mode=request.mode)
 

@@ -269,6 +269,115 @@ def _is_in_period(day: dt.date, config: ComparisonConfig) -> bool:
     return True
 
 
+_RU_MONTH_SHORT = {
+    'янв': 1, 'фев': 2, 'мар': 3, 'апр': 4, 'май': 5, 'июн': 6,
+    'июл': 7, 'авг': 8, 'сен': 9, 'окт': 10, 'ноя': 11, 'дек': 12,
+}
+
+
+def _hhmm_to_minutes(val: Any) -> int | None:
+    """Convert integer HHMM (e.g. 725 → 07:25 → 445 min) to minutes from midnight."""
+    if val is None:
+        return None
+    try:
+        v = int(val)
+        if v < 0:
+            return None
+        h = v // 100
+        m = v % 100
+        if h > 23 or m > 59:
+            return None
+        return h * 60 + m
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_notebook_day_header(val: Any) -> tuple[int, int] | None:
+    """Parse '1авг.' → (day=1, month=8). Returns (day, month) or None."""
+    if not isinstance(val, str):
+        return None
+    s = val.strip().lower().rstrip('.')
+    for abbr, month in _RU_MONTH_SHORT.items():
+        if s.endswith(abbr):
+            try:
+                day = int(s[: -len(abbr)].strip())
+                if 1 <= day <= 31:
+                    return (day, month)
+            except ValueError:
+                pass
+    return None
+
+
+def _read_notebook_data(
+    notebook_excel_bytes: bytes,
+    reference_dates: list[dt.date] | None = None,
+) -> tuple[dict, dict]:
+    """Parse тетрадь (manual notebook) with HHMM arrival/departure columns per day.
+
+    Returns (minutes_by_day, fio_by_key).
+    minutes_by_day: {(fio_key, date): effective_minutes}
+      A day with only arrival or only departure is recorded as 0 minutes
+      (person was present, just incomplete data).
+    """
+    wb = _load_workbook_from_bytes(notebook_excel_bytes)
+    ws = next((s for s in wb.worksheets if s.max_row > 1), None)
+    if ws is None:
+        return {}, {}
+
+    year = (reference_dates[0].year if reference_dates else dt.date.today().year)
+
+    header_row: tuple = next(ws.iter_rows(min_row=1, max_row=1, values_only=True))
+
+    fio_idx = next(
+        (i for i, h in enumerate(header_row) if h and 'фио' in str(h).lower()), 0
+    )
+
+    # Build list of (arrival_col, departure_col, date)
+    day_columns: list[tuple[int, int, dt.date]] = []
+    for i, h in enumerate(header_row):
+        parsed = _parse_notebook_day_header(h)
+        if parsed is not None:
+            day_num, month_num = parsed
+            dep_idx = i + 1
+            try:
+                d = dt.date(year, month_num, day_num)
+                day_columns.append((i, dep_idx, d))
+            except ValueError:
+                pass
+
+    minutes_by_day: dict = {}
+    fio_by_key: dict = {}
+    default_config = ComparisonConfig()
+
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        fio_val = row[fio_idx] if fio_idx < len(row) else None
+        if not fio_val:
+            continue
+        fio_key = normalize_fio(fio_val)
+        if not fio_key or not _is_person_fio_tokens(_extract_fio_tokens(fio_val)):
+            continue
+        fio_by_key.setdefault(fio_key, normalize_fio_for_output(fio_val))
+
+        for arr_idx, dep_idx, day in day_columns:
+            arr_raw = row[arr_idx] if arr_idx < len(row) else None
+            dep_raw = row[dep_idx] if dep_idx < len(row) else None
+            arr_min = _hhmm_to_minutes(arr_raw)
+            dep_min = _hhmm_to_minutes(dep_raw)
+
+            if arr_min is None and dep_min is None:
+                continue  # no data for this day
+
+            if arr_min is not None and dep_min is not None:
+                effective = _compute_report_minutes(arr_min, dep_min, default_config)
+            else:
+                effective = 0  # present but incomplete record
+
+            key = (fio_key, day)
+            minutes_by_day[key] = minutes_by_day.get(key, 0) + effective
+
+    return minutes_by_day, fio_by_key
+
+
 def _normalize_header(value: Any) -> str:
     text = str(value).strip().lower()
     text = re.sub(r'\s+', ' ', text)
@@ -1106,6 +1215,7 @@ def compare_report_and_timesheet(
     report_excel_bytes: bytes,
     timesheet_excel_bytes: bytes,
     config: ComparisonConfig | None = None,
+    notebook_excel_bytes: bytes | None = None,
 ) -> bytes:
     if not config:
         config = ComparisonConfig()
@@ -1123,7 +1233,15 @@ def compare_report_and_timesheet(
 
     timesheet_minutes, timesheet_fio_by_key = _read_timesheet_minutes(timesheet_excel_bytes, reference_dates=reference_dates)
 
-    return _build_output_workbook(report_shifts, timesheet_minutes, timesheet_fio_by_key, config, one_sided_days)
+    notebook_minutes: dict = {}
+    notebook_fio_by_key: dict = {}
+    if notebook_excel_bytes:
+        notebook_minutes, notebook_fio_by_key = _read_notebook_data(notebook_excel_bytes, reference_dates)
+
+    return _build_output_workbook(
+        report_shifts, timesheet_minutes, timesheet_fio_by_key, config, one_sided_days,
+        notebook_minutes=notebook_minutes, notebook_fio_by_key=notebook_fio_by_key,
+    )
 
 
 def compare_report_and_many_timesheets(
@@ -1167,7 +1285,12 @@ def _build_output_workbook(
     timesheet_fio_by_key: dict,
     config: ComparisonConfig,
     one_sided_days: list[_ReportDay] | None = None,
+    notebook_minutes: dict | None = None,
+    notebook_fio_by_key: dict | None = None,
 ) -> bytes:
+    notebook_minutes = notebook_minutes or {}
+    notebook_fio_by_key = notebook_fio_by_key or {}
+
     # Агрегируем минуты из отчёта по (fio_key, day)
     report_minutes_by_day: dict = {}
     fio_by_key: dict = {}
@@ -1179,38 +1302,57 @@ def _build_output_workbook(
         report_minutes_by_day[key] = report_minutes_by_day.get(key, 0) + int(s.report_minutes)
         fio_by_key.setdefault(s.fio_key, s.fio)
 
-    # Лист 1: Табель > отчёта (табель превышает отчёт более чем на threshold)
-    sheet1 = []
-    for (fio_key, day), report_minutes in report_minutes_by_day.items():
-        t_minutes = int(timesheet_minutes.get((fio_key, day)) or 0)
-        diff = t_minutes - int(report_minutes)
-        if diff <= config.threshold_minutes:
+    # Объединяем отчёт и тетрадь: combined_minutes_by_day используется вместо report_minutes_by_day
+    combined_minutes_by_day: dict = dict(report_minutes_by_day)
+    for key, nb_min in notebook_minutes.items():
+        if not _is_in_period(key[1], config):
             continue
-        fio_value = (
+        combined_minutes_by_day[key] = combined_minutes_by_day.get(key, 0) + nb_min
+
+    # Все сотрудники, у которых есть данные в отчёте или тетради
+    combined_fio_keys = (
+        set(fio_by_key.keys())
+        | {d.fio_key for d in (one_sided_days or [])}
+        | set(notebook_fio_by_key.keys())
+    )
+
+    def _fio_display(fio_key: str) -> str:
+        return (
             fio_by_key.get(fio_key)
+            or notebook_fio_by_key.get(fio_key)
             or timesheet_fio_by_key.get(fio_key)
             or fio_for_output(fio_key)
         )
-        sheet1.append((fio_value, day, t_minutes, int(report_minutes), diff))
 
-    # Лист 2: В табеле есть, в отчёте нет
+    # Лист 1: Табель > отчёта (табель превышает combined более чем на threshold)
+    sheet1 = []
+    for (fio_key, day), combined_minutes in combined_minutes_by_day.items():
+        t_minutes = int(timesheet_minutes.get((fio_key, day)) or 0)
+        diff = t_minutes - int(combined_minutes)
+        if diff <= config.threshold_minutes:
+            continue
+        sheet1.append((_fio_display(fio_key), day, t_minutes, int(combined_minutes), diff))
+
+    # Лист 2: В табеле есть, но нет ни в отчёте, ни в тетради
     one_sided_keys = {(d.fio_key, d.date) for d in (one_sided_days or [])}
-    # Сотрудники, у которых есть хотя бы одна запись в отчёте за весь период
-    report_fio_keys = set(fio_by_key.keys()) | {d.fio_key for d in (one_sided_days or [])}
     sheet2 = []
     for (fio_key, day), t_minutes in timesheet_minutes.items():
         if not _is_in_period(day, config):
             continue
         if t_minutes is None or t_minutes <= 0:
             continue
-        if (fio_key, day) in report_minutes_by_day:
+        if (fio_key, day) in combined_minutes_by_day:
             continue
         if (fio_key, day) in one_sided_keys:
             continue
-        # Если сотрудника нет в отчёте совсем — у него нет скана, пропускаем
-        if fio_key not in report_fio_keys:
+        # Если сотрудника нет ни в отчёте, ни в тетради совсем — нет скана, пропускаем
+        if fio_key not in combined_fio_keys:
             continue
-        fio_value = timesheet_fio_by_key.get(fio_key, fio_for_output(fio_key))
+        fio_value = (
+            notebook_fio_by_key.get(fio_key)
+            or timesheet_fio_by_key.get(fio_key)
+            or fio_for_output(fio_key)
+        )
         sheet2.append((fio_value, day, 0, int(t_minutes)))
 
     sheet1.sort(key=lambda r: (r[0], r[1]))
