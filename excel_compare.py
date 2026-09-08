@@ -559,7 +559,22 @@ def _read_report_shifts_event_log(wb, config: ComparisonConfig) -> tuple[list[_R
                             else:
                                 mid_gap += gap_dur
                             gap_start = None
-                        # else: дублирующий вход пока уже внутри смены без gap — игнорируем
+                        else:
+                            # Новый вход без предварительного выхода.
+                            # Если прошло более 4 часов — предыдущий вход остался без ухода,
+                            # закрываем как arrival_only и начинаем новую смену.
+                            elapsed = int((ts - open_in).total_seconds() // 60)
+                            if elapsed > _MAX_BREAK_MIN:
+                                one_sided.append(_ReportDay(
+                                    fio_key=fio_key, fio=fio, date=open_in.date(),
+                                    arrival_min=open_in.hour * 60 + open_in.minute,
+                                    departure_min=None,
+                                    mark_type='arrival_only', report_minutes=None,
+                                ))
+                                open_in = ts
+                                mid_gap = 0
+                                gap_start = None
+                            # else: дублирующий вход — игнорируем
                     else:  # et == 'out'
                         if open_in is None:
                             # Выход без входа — односторонняя отметка
