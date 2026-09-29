@@ -1142,7 +1142,14 @@ def _read_timesheet_employees(timesheet_excel_bytes: bytes, reference_dates: lis
                 is_wide = bool(date_columns)
 
             if not is_long and not is_wide:
-                continue
+                # No resolved date columns — still accept if there are day-number headers
+                # (e.g. "1 Вт", "2 Ср") without reference_dates; FIO reading doesn't need dates
+                has_day_cols = any(
+                    _parse_timesheet_header_day_weekday(h) is not None
+                    for idx, h in enumerate(headers) if idx != fio_idx
+                )
+                if not has_day_cols:
+                    continue
 
             out: dict[str, str] = {}
             for row in ws.iter_rows(min_row=header_row + 1):
