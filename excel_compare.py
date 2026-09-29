@@ -57,9 +57,11 @@ _DATE_FORMATS: tuple[str, ...] = (
 
 _DATE_IN_TEXT_RE = re.compile(r'(?P<d>\d{1,2}[./-]\d{1,2}[./-]\d{2,4})')
 _ISO_DATE_IN_TEXT_RE = re.compile(r'(?P<d>\d{4}[./-]\d{1,2}[./-]\d{1,2})')
-_TIMESHEET_GROUP_RE = re.compile(r'^\d{1,2}\.\d{2,3}[A-Za-zА-Яа-я]?\b')
+_TIMESHEET_GROUP_RE = re.compile(r'^\d{1,2}\.\d{1,3}[A-Za-zА-Яа-я]?\b')
 
-_FIO_PATTERNS = [re.compile(p) for p in [r'\bфио\b', r'сотруд', r'работник']]
+_FIO_PATTERNS = [re.compile(p) for p in [
+    r'\bфио\b', r'ф\s*\.\s*и\s*\.\s*о', r'сотруд', r'работник', r'фамили', r'наименован',
+]]
 _DATE_PATTERNS = [re.compile(p) for p in [r'\bдата\b', r'\bдень\b', r'\bdate\b']]
 _REPORT_ARRIVAL_PATTERNS = [re.compile(p) for p in ['приход', r'\bвход\b', 'начал']]
 _REPORT_DEPARTURE_PATTERNS = [re.compile(p) for p in ['уход', r'\bвыход\b', 'конец', 'оконч']]
@@ -999,13 +1001,16 @@ def _is_timesheet_non_employee_row(row: tuple, fio_idx: int) -> bool:
         return True
     if _TIMESHEET_GROUP_RE.match(text):
         return True
+    # Check known department/section first-word markers
+    first_word = re.split(r'[\s\.,]', lowered)[0]
+    if first_word in _NOT_PERSON_FIRST_WORDS:
+        return True
     is_bold = bool(getattr(getattr(fio_cell, 'font', None), 'bold', False))
     if is_bold:
         return True
-    # '#' in column 0 only indicates a section header when the FIO column is also 0
+    # FIO value that is purely a marker symbol (e.g. '#') is not an employee
     if fio_idx == 0:
-        first_text = str(fio_value).strip()
-        if first_text.startswith('#'):
+        if text.startswith('#'):
             return True
     return False
 
@@ -1096,6 +1101,16 @@ def _read_timesheet_minutes(timesheet_excel_bytes: bytes, reference_dates: list[
 
             if not date_columns and reference_dates:
                 inferred = _infer_timesheet_month_date_columns(headers, fio_idx, reference_dates)
+                date_columns = inferred
+
+            # Last resort: no reference_dates but day-number headers exist — infer from today
+            if not date_columns and not reference_dates:
+                today = dt.date.today()
+                fallback_refs = [
+                    dt.date(today.year, today.month, d)
+                    for d in range(1, calendar.monthrange(today.year, today.month)[1] + 1)
+                ]
+                inferred = _infer_timesheet_month_date_columns(headers, fio_idx, fallback_refs)
                 date_columns = inferred
 
             if date_columns:
